@@ -2,15 +2,10 @@
 
 1:
   model_name: "neuralmagic/Qwen2-0.5B-Instruct-FP8"
-  number_of_jobs: 6
+  number_of_jobs: 2
   gpu: "gpu:rtxa4000:1"
-
+  
 2:
-  model_name: "Qwen/Qwen2.5-0.5B-Instruct"
-  number_of_jobs: 4
-  gpu: "gpu:rtxa4000:1"
-
-3:
   model_name: "neuralmagic/Llama-3.2-1B-Instruct-FP8"
   number_of_jobs: 2
   gpu: "gpu:rtxa4000:1" 
