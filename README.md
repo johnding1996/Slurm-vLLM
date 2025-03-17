@@ -24,7 +24,7 @@ cd <repository-directory>
 ```
 
 The installation script will:
-- Check for required dependencies (Python 3.9-3.12, CUDA 12+, Slurm)
+- Check for required dependencies (Python 3.9-3.12, CUDA 12.4 only, Slurm)
 - Create a virtual environment in `./venv`
 - Install vLLM and other dependencies
 - Make scripts executable
