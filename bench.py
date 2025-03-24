@@ -37,8 +37,8 @@ def colorize(text, color):
 # Constants
 BASE_URL = "http://localhost:9090/v1"  # OpenAI-compatible endpoint
 CONFIG_PATH = "config.yaml"
-MAX_CONCURRENCY = 50  # Maximum concurrent requests
-UPDATE_INTERVAL = 5  # Seconds between metric updates
+MAX_CONCURRENCY = 500  # Maximum concurrent requests
+UPDATE_INTERVAL = 2  # Seconds between metric updates
 RESPONSE_SAMPLE_SIZE = 2  # Number of example responses to keep per model/question type
 MAX_TOKENS = 1000  # Increased max tokens to ensure complete answers
 
@@ -111,6 +111,34 @@ def load_models_from_config():
         sys.exit(1)
 
 
+def shorten_model_name(name):
+    """Shorten model name by taking first 4 chars of each part split by / or -"""
+    # First split by '/'
+    if "/" in name:
+        parts = name.split("/")
+        shortened_parts = []
+        for part in parts:
+            # Then split each part by '-' if needed
+            if "-" in part:
+                subparts = part.split("-")
+                shortened_subparts = [
+                    subpart[:4] if len(subpart) > 4 else subpart for subpart in subparts
+                ]
+                shortened_parts.append("-".join(shortened_subparts))
+            else:
+                shortened_parts.append(part[:4] if len(part) > 4 else part)
+        return "/".join(shortened_parts)
+
+    # If no '/', just split by '-'
+    elif "-" in name:
+        parts = name.split("-")
+        shortened_parts = [part[:4] if len(part) > 4 else part for part in parts]
+        return "-".join(shortened_parts)
+
+    # No separators
+    return name[:4] if len(name) > 4 else name
+
+
 def initialize_metrics(models):
     """Initialize metrics tracking for all models and question types."""
     global metrics, responses
@@ -121,6 +149,10 @@ def initialize_metrics(models):
             "success": 0,
             "latencies": [],
             "tokens_per_second": [],
+            "max_latency_all_time": 0,  # Track all-time maximum latency
+            "total_tokens": 0,  # Track total tokens generated
+            "time_window_start": None,  # For measuring throughput in a time window
+            "time_window_tokens": 0,  # Tokens generated in current time window
             "question_types": {},
         }
         responses[model_name] = {}
@@ -150,7 +182,7 @@ async def make_request(client, model, question_type):
     # Increment active requests counter
     active_requests += 1
 
-    start_time = time.time()
+    request_start_time = time.time()
     success = False
     latency = 0
     output_tokens = 0
@@ -160,13 +192,13 @@ async def make_request(client, model, question_type):
         response = await client.completions.create(
             model=model,
             prompt=question,
-            max_tokens=MAX_TOKENS,  # Increased to ensure complete answers
+            max_tokens=MAX_TOKENS,
             temperature=0.7,
             top_p=0.9,
         )
 
         end_time = time.time()
-        latency = end_time - start_time
+        latency = end_time - request_start_time
         response_text = response.choices[0].text.strip()
         output_tokens = len(response_text.split())  # Approximate
         success = True
@@ -176,27 +208,45 @@ async def make_request(client, model, question_type):
         metrics[model]["success"] += 1
         metrics[model]["latencies"].append(latency)
 
+        # Track total tokens for aggregate throughput calculation
+        metrics[model]["total_tokens"] += output_tokens
+
+        # Initialize time window if not set
+        if metrics[model]["time_window_start"] is None:
+            metrics[model]["time_window_start"] = time.time()
+            metrics[model]["time_window_tokens"] = 0
+
+        # Update tokens in current time window
+        metrics[model]["time_window_tokens"] += output_tokens
+
+        # If time window is over 30 seconds, calculate tokens/sec and reset window
+        time_in_window = time.time() - metrics[model]["time_window_start"]
+        if time_in_window >= 30:  # 30-second rolling window
+            tokens_per_second = metrics[model]["time_window_tokens"] / time_in_window
+            metrics[model]["tokens_per_second"].append(tokens_per_second)
+
+            # Reset window
+            metrics[model]["time_window_start"] = time.time()
+            metrics[model]["time_window_tokens"] = 0
+
+            # Keep only the last 10 measurements
+            if len(metrics[model]["tokens_per_second"]) > 10:
+                metrics[model]["tokens_per_second"] = metrics[model][
+                    "tokens_per_second"
+                ][-10:]
+
+        # Update the all-time maximum latency
+        if latency > metrics[model]["max_latency_all_time"]:
+            metrics[model]["max_latency_all_time"] = latency
+
         # Keep only last 100 latency samples for rolling average
         if len(metrics[model]["latencies"]) > 100:
             metrics[model]["latencies"] = metrics[model]["latencies"][-100:]
-
-        # Calculate tokens per second
-        tokens_per_second = output_tokens / latency if latency > 0 else 0
-        metrics[model]["tokens_per_second"].append(tokens_per_second)
-
-        # Keep only last 100 tokens_per_second samples
-        if len(metrics[model]["tokens_per_second"]) > 100:
-            metrics[model]["tokens_per_second"] = metrics[model]["tokens_per_second"][
-                -100:
-            ]
 
         # Update question type specific metrics
         metrics[model]["question_types"][question_type]["count"] += 1
         metrics[model]["question_types"][question_type]["success"] += 1
         metrics[model]["question_types"][question_type]["latencies"].append(latency)
-        metrics[model]["question_types"][question_type]["tokens_per_second"].append(
-            tokens_per_second
-        )
 
         # Store example response (keeping only a limited number of samples)
         if len(responses[model][question_type]) < RESPONSE_SAMPLE_SIZE:
@@ -206,10 +256,14 @@ async def make_request(client, model, question_type):
 
     except Exception as e:
         end_time = time.time()
-        latency = end_time - start_time
+        latency = end_time - request_start_time
         metrics[model]["count"] += 1
         metrics[model]["question_types"][question_type]["count"] += 1
         # Don't increment success count
+
+        # Even failed requests can update the max latency
+        if latency > metrics[model]["max_latency_all_time"]:
+            metrics[model]["max_latency_all_time"] = latency
 
     finally:
         # Decrement active requests counter
@@ -270,7 +324,7 @@ async def run_benchmark(models):
 
 
 async def display_metrics(models, interval):
-    """Periodically display current metrics."""
+    """Periodically display metrics."""
     global metrics, start_time
 
     while True:
@@ -302,10 +356,11 @@ async def display_metrics(models, interval):
         summary_headers = [
             "Model",
             "Requests",
-            "Success Rate",
+            "Failed",
             "Avg Latency (s)",
+            "Max Latency (s)",
+            "99% Latency (s)",
             "Tokens/sec",
-            "Wait for 1000 req",
         ]
 
         # Collect metrics for all models
@@ -313,49 +368,71 @@ async def display_metrics(models, interval):
             if model_name in metrics:
                 m = metrics[model_name]
 
+                # Get model index and shortened name
+                model_index = models[model_name]["index"]
+                short_name = shorten_model_name(model_name)
+                display_name = f"{model_index}:{short_name}"
+
                 # Calculate summary metrics
                 requests = m["count"]
-                success_rate = (m["success"] / requests * 100) if requests > 0 else 0
+                failed = requests - m["success"]
                 avg_latency = (
                     sum(m["latencies"]) / len(m["latencies"]) if m["latencies"] else 0
                 )
-                avg_tokens_per_sec = (
-                    sum(m["tokens_per_second"]) / len(m["tokens_per_second"])
-                    if m["tokens_per_second"]
-                    else 0
-                )
 
-                # Calculate wait time for 1000 requests
-                # Assuming we can process MAX_CONCURRENCY requests in parallel
-                # and each request takes avg_latency seconds
-                if avg_latency > 0:
-                    wait_time_1000 = (1000 / MAX_CONCURRENCY) * avg_latency
-                    wait_time_str = (
-                        f"{int(wait_time_1000 // 60)}m{int(wait_time_1000 % 60)}s"
+                # Use the all-time max latency instead of just recent samples
+                max_latency = m["max_latency_all_time"]
+
+                # Calculate 99th percentile latency (top 1%)
+                if len(m["latencies"]) > 0:
+                    sorted_latencies = sorted(m["latencies"])
+                    percentile_99_idx = max(0, int(len(sorted_latencies) * 0.99) - 1)
+                    percentile_99_latency = sorted_latencies[percentile_99_idx]
+                else:
+                    percentile_99_latency = 0
+
+                # Calculate current throughput
+                # If we have token/sec measurements from our time windows, use their average
+                if m["tokens_per_second"]:
+                    avg_tokens_per_sec = sum(m["tokens_per_second"]) / len(
+                        m["tokens_per_second"]
                     )
+                # If we have no measurements yet but have a current window, calculate from that
+                elif m["time_window_start"] is not None:
+                    time_in_current_window = time.time() - m["time_window_start"]
+                    if time_in_current_window > 0 and m["time_window_tokens"] > 0:
+                        avg_tokens_per_sec = (
+                            m["time_window_tokens"] / time_in_current_window
+                        )
+                    else:
+                        avg_tokens_per_sec = 0
+                # Fallback: calculate from total tokens and runtime if we have completed requests
+                elif runtime > 0 and m["total_tokens"] > 0:
+                    avg_tokens_per_sec = m["total_tokens"] / runtime
                 else:
-                    wait_time_str = "N/A"
+                    avg_tokens_per_sec = 0
 
-                # Format success rate with color based on value
-                if success_rate >= 95:
-                    success_rate_str = colorize(f"{success_rate:.1f}%", Colors.GREEN)
-                elif success_rate >= 80:
-                    success_rate_str = colorize(f"{success_rate:.1f}%", Colors.YELLOW)
+                # Format failed count with color based on value
+                if failed == 0:
+                    failed_str = colorize("0", Colors.GREEN)
+                elif failed <= requests * 0.05:  # Less than 5% failed
+                    failed_str = colorize(f"{failed}", Colors.YELLOW)
                 else:
-                    success_rate_str = colorize(f"{success_rate:.1f}%", Colors.RED)
+                    failed_str = colorize(f"{failed}", Colors.RED)
 
                 summary_table.append(
                     [
-                        model_name,
+                        display_name,
                         requests,
-                        success_rate_str,
+                        failed_str,
                         f"{avg_latency:.2f}",
+                        f"{max_latency:.2f}",
+                        f"{percentile_99_latency:.2f}",
                         f"{avg_tokens_per_sec:.1f}",
-                        wait_time_str,
                     ]
                 )
 
-        # Sort table by model
+        # Sort table by model index
         summary_table.sort(key=lambda x: x[0])
 
         # Print summary table
@@ -401,10 +478,11 @@ def generate_final_report(models):
     summary_headers = [
         "Model",
         "Requests",
-        "Success Rate",
+        "Failed",
         "Avg Latency (s)",
+        "Max Latency (s)",
+        "99% Latency (s)",
         "Tokens/sec",
-        "Wait for 1000 req",
     ]
 
     # Collect metrics for all models
@@ -412,47 +490,56 @@ def generate_final_report(models):
         if model_name in metrics:
             m = metrics[model_name]
 
+            # Get model index and shortened name
+            model_index = models[model_name]["index"]
+            short_name = shorten_model_name(model_name)
+            display_name = f"{model_index}:{short_name}"
+
             # Calculate summary metrics
             requests = m["count"]
-            success_rate = (m["success"] / requests * 100) if requests > 0 else 0
+            failed = requests - m["success"]
             avg_latency = (
                 sum(m["latencies"]) / len(m["latencies"]) if m["latencies"] else 0
             )
-            avg_tokens_per_sec = (
-                sum(m["tokens_per_second"]) / len(m["tokens_per_second"])
-                if m["tokens_per_second"]
-                else 0
-            )
 
-            # Calculate wait time for 1000 requests
-            if avg_latency > 0:
-                wait_time_1000 = (1000 / MAX_CONCURRENCY) * avg_latency
-                wait_time_str = (
-                    f"{int(wait_time_1000 // 60)}m{int(wait_time_1000 % 60)}s"
-                )
-            else:
-                wait_time_str = "N/A"
+            # Use the all-time max latency instead of just recent samples
+            max_latency = m["max_latency_all_time"]
 
-            # Format success rate with color based on value
-            if success_rate >= 95:
-                success_rate_str = colorize(f"{success_rate:.1f}%", Colors.GREEN)
-            elif success_rate >= 80:
-                success_rate_str = colorize(f"{success_rate:.1f}%", Colors.YELLOW)
+            # Calculate 99th percentile latency (top 1%)
+            if len(m["latencies"]) > 0:
+                sorted_latencies = sorted(m["latencies"])
+                percentile_99_idx = max(0, int(len(sorted_latencies) * 0.99) - 1)
+                percentile_99_latency = sorted_latencies[percentile_99_idx]
             else:
-                success_rate_str = colorize(f"{success_rate:.1f}%", Colors.RED)
+                percentile_99_latency = 0
+
+            # Calculate overall tokens per second for the entire runtime
+            if runtime > 0 and m["total_tokens"] > 0:
+                avg_tokens_per_sec = m["total_tokens"] / runtime
+            else:
+                avg_tokens_per_sec = 0
+
+            # Format failed count with color based on value
+            if failed == 0:
+                failed_str = colorize("0", Colors.GREEN)
+            elif failed <= requests * 0.05:  # Less than 5% failed
+                failed_str = colorize(f"{failed}", Colors.YELLOW)
+            else:
+                failed_str = colorize(f"{failed}", Colors.RED)
 
             summary_table.append(
                 [
-                    model_name,
+                    display_name,
                     requests,
-                    success_rate_str,
+                    failed_str,
                     f"{avg_latency:.2f}",
+                    f"{max_latency:.2f}",
+                    f"{percentile_99_latency:.2f}",
                     f"{avg_tokens_per_sec:.1f}",
-                    wait_time_str,
                 ]
             )
 
-    # Sort table by model
+    # Sort table by model index
     summary_table.sort(key=lambda x: x[0])
 
     # Print summary table
@@ -462,7 +549,12 @@ def generate_final_report(models):
     print(colorize("\nExample Responses:", Colors.BOLD))
 
     for model_name in models.keys():
-        print(colorize(f"\n{model_name}:", Colors.CYAN + Colors.BOLD))
+        # Get model index and shortened name for display
+        model_index = models[model_name]["index"]
+        short_name = shorten_model_name(model_name)
+        display_name = f"{model_index}:{short_name}"
+
+        print(colorize(f"\n{display_name}:", Colors.CYAN + Colors.BOLD))
 
         for q_type in QUESTION_TYPES:
             if (

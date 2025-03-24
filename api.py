@@ -8,23 +8,30 @@ import re
 import subprocess
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
 import statistics
 import random
 import logging
+from enum import Enum, auto
 
-import aiohttp
-from fastapi import FastAPI, Request, Response, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from contextlib import asynccontextmanager
 from tabulate import tabulate
 import uvicorn
-from pydantic import BaseModel
 import httpx
 
 # Configure logging to suppress access logs
 logging.getLogger("uvicorn.access").setLevel(logging.ERROR)
 logging.getLogger("uvicorn.error").setLevel(logging.ERROR)
+
+
+# Backend health states
+class BackendState(Enum):
+    HEALTHY = auto()  # Fully operational
+    DEGRADED = auto()  # Experienced failures but may recover
+    UNHEALTHY = auto()  # Multiple failures, under recovery monitoring
+    INITIALIZING = auto()  # New backend, not yet proven healthy
+    DEAD = auto()  # Permanently removed (not in Slurm output)
 
 
 # ANSI color codes for colorful output
@@ -71,35 +78,35 @@ backends = (
 )  # model_index -> list of {"node": str, "port": int, "model_name": str, "job_name": str, "latency": float}
 model_names = {}  # model_index -> model_name
 recent_latencies = {}  # node:port -> list of recent latencies
-backend_failures = {}  # node:port -> count of recent failures
+backend_failures = {}  # node:port -> count of consecutive failures
+backend_successes = {}  # node:port -> count of consecutive successful health checks
 backend_requests = {}  # node:port -> count of requests sent
-backend_health = {}  # node:port -> bool (is healthy)
+backend_states = {}  # node:port -> BackendState
+backend_in_flight = {}  # node:port -> count of in-flight requests
+backend_check_times = {}  # node:port -> next check time
+backend_discovery_times = {}  # node:port -> when backend was first discovered
 
 # Monitoring settings
 MONITOR_INTERVAL = 5  # seconds
 MAX_LATENCY_SAMPLES = 10
-FAILURE_THRESHOLD = 3
-BACKEND_TIMEOUT = 10  # seconds
-FAILURE_COOLDOWN = 60  # seconds after which to retry a failed backend
+FAILURE_THRESHOLD = 10  # consecutive failures before marking as UNHEALTHY
+SUCCESS_THRESHOLD = 3  # consecutive successes before promoting from DEGRADED to HEALTHY
+BACKEND_TIMEOUT = 10  # seconds for health check timeout
+INITIAL_GRACE_PERIOD = 0  # No grace period - backends should be checked immediately
+MAX_INITIALIZING_TIME = 180  # seconds before INITIALIZING -> UNHEALTHY
+REQUEST_STREAM_TIMEOUT = 60  # seconds to wait for first token in streaming response
+MAX_RETRIES = 3  # maximum number of retries for a failed request
+DEGRADED_CHECK_INTERVAL = 3  # seconds between DEGRADED backend checks
+UNHEALTHY_CHECK_INTERVAL = 10  # initial seconds between UNHEALTHY backend checks
+INITIALIZING_CHECK_INTERVAL = (
+    0  # seconds between INITIALIZING backend checks - check immediately
+)
+MAX_BACKOFF_INTERVAL = 60  # maximum seconds for exponential backoff
 
 # Model regex pattern
 MODEL_PATTERN = (
     r"^v(\d{2})(\d{2})(\d{3})$"  # Format: v[model_index][job_id][port_suffix]
 )
-
-
-class CompletionRequest(BaseModel):
-    model: str
-    prompt: str
-    max_tokens: Optional[int] = 100
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 1.0
-    n: Optional[int] = 1
-    stream: Optional[bool] = False
-    stop: Optional[List[str]] = None
-    presence_penalty: Optional[float] = 0.0
-    frequency_penalty: Optional[float] = 0.0
-    user: Optional[str] = None
 
 
 def parse_arguments():
@@ -135,6 +142,8 @@ def extract_job_info(job_name):
 async def check_backend_health(node, port):
     """Check if a backend is healthy by making a simple request."""
     url = f"http://{node}:{port}/v1/models"
+    backend_key = f"{node}:{port}"
+
     try:
         async with httpx.AsyncClient(timeout=BACKEND_TIMEOUT) as client:
             start_time = time.time()
@@ -143,35 +152,149 @@ async def check_backend_health(node, port):
 
             if response.status_code == 200:
                 # Update latency information
-                if f"{node}:{port}" not in recent_latencies:
-                    recent_latencies[f"{node}:{port}"] = []
+                if backend_key not in recent_latencies:
+                    recent_latencies[backend_key] = []
 
-                recent_latencies[f"{node}:{port}"].append(latency)
+                recent_latencies[backend_key].append(latency)
                 # Keep only the most recent samples
-                if len(recent_latencies[f"{node}:{port}"]) > MAX_LATENCY_SAMPLES:
-                    recent_latencies[f"{node}:{port}"] = recent_latencies[
-                        f"{node}:{port}"
-                    ][-MAX_LATENCY_SAMPLES:]
+                if len(recent_latencies[backend_key]) > MAX_LATENCY_SAMPLES:
+                    recent_latencies[backend_key] = recent_latencies[backend_key][
+                        -MAX_LATENCY_SAMPLES:
+                    ]
 
-                # Reset failure count
-                backend_failures[f"{node}:{port}"] = 0
-                backend_health[f"{node}:{port}"] = True
+                # Update health tracking
+                backend_failures[backend_key] = 0
+                backend_successes[backend_key] = (
+                    backend_successes.get(backend_key, 0) + 1
+                )
+
+                # State transitions based on consecutive successes
+                current_state = backend_states.get(
+                    backend_key, BackendState.INITIALIZING
+                )
+
+                if (
+                    current_state == BackendState.DEGRADED
+                    and backend_successes[backend_key] >= SUCCESS_THRESHOLD
+                ):
+                    # Promote from DEGRADED to HEALTHY after consecutive successes
+                    backend_states[backend_key] = BackendState.HEALTHY
+                    print(
+                        colorize(
+                            f"Backend {backend_key} recovered: DEGRADED → HEALTHY",
+                            Colors.GREEN,
+                        )
+                    )
+
+                elif (
+                    current_state == BackendState.UNHEALTHY
+                    and backend_successes[backend_key] >= SUCCESS_THRESHOLD
+                ):
+                    # Promote from UNHEALTHY to DEGRADED after consecutive successes
+                    backend_states[backend_key] = BackendState.DEGRADED
+                    print(
+                        colorize(
+                            f"Backend {backend_key} improving: UNHEALTHY → DEGRADED",
+                            Colors.YELLOW,
+                        )
+                    )
+
+                elif current_state == BackendState.INITIALIZING:
+                    # New backend is now healthy
+                    backend_states[backend_key] = BackendState.HEALTHY
+                    print(
+                        colorize(
+                            f"Backend {backend_key} ready: INITIALIZING → HEALTHY",
+                            Colors.GREEN,
+                        )
+                    )
+
+                # Update check time for next health check based on state
+                update_next_check_time(backend_key)
+
                 return True, latency
             else:
-                backend_failures[f"{node}:{port}"] = (
-                    backend_failures.get(f"{node}:{port}", 0) + 1
+                # Handle failure
+                return handle_health_check_failure(
+                    backend_key, f"HTTP {response.status_code}"
                 )
-                if backend_failures[f"{node}:{port}"] >= FAILURE_THRESHOLD:
-                    backend_health[f"{node}:{port}"] = False
-                return False, None
     except Exception as e:
-        # Increment failure count
-        backend_failures[f"{node}:{port}"] = (
-            backend_failures.get(f"{node}:{port}", 0) + 1
+        # Handle exception
+        return handle_health_check_failure(backend_key, str(e))
+
+
+def update_next_check_time(backend_key):
+    """Update when to next check a backend based on its current state."""
+    current_state = backend_states.get(backend_key, BackendState.HEALTHY)
+
+    if current_state == BackendState.DEGRADED:
+        # Check DEGRADED backends frequently
+        backend_check_times[backend_key] = time.time() + DEGRADED_CHECK_INTERVAL
+
+    elif current_state == BackendState.UNHEALTHY:
+        # Use exponential backoff for UNHEALTHY backends, with a maximum interval
+        failures = backend_failures.get(backend_key, 0)
+        backoff = min(
+            UNHEALTHY_CHECK_INTERVAL * (2 ** (failures - FAILURE_THRESHOLD)),
+            MAX_BACKOFF_INTERVAL,
         )
-        if backend_failures[f"{node}:{port}"] >= FAILURE_THRESHOLD:
-            backend_health[f"{node}:{port}"] = False
-        return False, None
+        backend_check_times[backend_key] = time.time() + backoff
+
+    elif current_state == BackendState.INITIALIZING:
+        # Check INITIALIZING backends frequently
+        backend_check_times[backend_key] = time.time() + INITIALIZING_CHECK_INTERVAL
+
+
+def handle_health_check_failure(backend_key, error_msg):
+    """Handle a failed health check and update backend state accordingly."""
+    # Increment failure count and reset success count
+    backend_failures[backend_key] = backend_failures.get(backend_key, 0) + 1
+    backend_successes[backend_key] = 0
+
+    current_state = backend_states.get(backend_key, BackendState.HEALTHY)
+
+    # State transitions based on failures
+    if current_state == BackendState.HEALTHY:
+        if backend_failures[backend_key] == 1:
+            # First failure for a healthy backend -> DEGRADED
+            backend_states[backend_key] = BackendState.DEGRADED
+            print(
+                colorize(
+                    f"Backend {backend_key} degraded: HEALTHY → DEGRADED ({error_msg})",
+                    Colors.YELLOW,
+                )
+            )
+
+    elif current_state == BackendState.DEGRADED:
+        if backend_failures[backend_key] >= FAILURE_THRESHOLD:
+            # Too many failures for a degraded backend -> UNHEALTHY
+            backend_states[backend_key] = BackendState.UNHEALTHY
+            print(
+                colorize(
+                    f"Backend {backend_key} unhealthy: DEGRADED → UNHEALTHY ({error_msg})",
+                    Colors.RED,
+                )
+            )
+
+    elif current_state == BackendState.INITIALIZING:
+        # Check if we've been trying to initialize for too long
+        discovery_time = backend_discovery_times.get(backend_key, time.time())
+        initializing_time = time.time() - discovery_time
+
+        if initializing_time > INITIAL_GRACE_PERIOD + MAX_INITIALIZING_TIME:
+            # Backend failed to initialize within time limit
+            backend_states[backend_key] = BackendState.UNHEALTHY
+            print(
+                colorize(
+                    f"Backend {backend_key} failed to initialize after {int(initializing_time)}s: INITIALIZING → UNHEALTHY",
+                    Colors.RED,
+                )
+            )
+
+    # Update check time for next health check
+    update_next_check_time(backend_key)
+
+    return False, None
 
 
 def get_avg_latency(node, port):
@@ -216,60 +339,179 @@ async def get_vllm_jobs():
 
 
 async def update_backend_info():
-    """Update backend information by checking Slurm jobs."""
+    """Update backend information by checking Slurm jobs and managing backend lifecycle."""
     global backends, model_names
 
-    # Get current vLLM jobs
+    # Get current vLLM jobs from Slurm
     jobs = await get_vllm_jobs()
 
-    # Temporary storage for new backend info
-    new_backends = {}
+    # Create a set of all current backend keys from Slurm
+    current_backend_keys = set()
+    for job in jobs:
+        current_backend_keys.add(f"{job['node']}:{job['port']}")
 
-    # Process each job
+    # Identify missing backends (removed from Slurm output)
+    for model_index in list(backends.keys()):
+        for backend in list(backends[model_index]):
+            backend_key = f"{backend['node']}:{backend['port']}"
+
+            if backend_key not in current_backend_keys:
+                # Backend no longer in Slurm output - mark as DEAD and remove
+                print(
+                    colorize(
+                        f"Backend {backend_key} no longer in Slurm output - marked as DEAD",
+                        Colors.RED,
+                    )
+                )
+                backends[model_index].remove(backend)
+                backend_states[backend_key] = BackendState.DEAD
+
+                # Clean up associated resources
+                if backend_key in recent_latencies:
+                    del recent_latencies[backend_key]
+                if backend_key in backend_failures:
+                    del backend_failures[backend_key]
+                if backend_key in backend_successes:
+                    del backend_successes[backend_key]
+                if backend_key in backend_check_times:
+                    del backend_check_times[backend_key]
+                if backend_key in backend_discovery_times:
+                    del backend_discovery_times[backend_key]
+
+        # Remove empty model entries
+        if not backends[model_index]:
+            del backends[model_index]
+            if model_index in model_names:
+                del model_names[model_index]
+
+    # Process each job from Slurm
     for job in jobs:
         model_index = job["model_index"]
         node = job["node"]
         port = job["port"]
+        backend_key = f"{node}:{port}"
 
         # Initialize if this model_index is new
-        if model_index not in new_backends:
-            new_backends[model_index] = []
+        if model_index not in backends:
+            backends[model_index] = []
 
         # Check if this backend is already in our list
         existing = False
-        for backend in new_backends[model_index]:
+        for backend in backends[model_index]:
             if backend["node"] == node and backend["port"] == port:
                 existing = True
                 break
 
         if not existing:
-            # Check health and get latency
-            is_healthy, latency = await check_backend_health(node, port)
+            # This is a new backend from Slurm
+            print(
+                colorize(
+                    f"Discovered new backend {backend_key} for model index {model_index}",
+                    Colors.CYAN,
+                )
+            )
+
+            # Record discovery time
+            backend_discovery_times[backend_key] = time.time()
+
+            # Mark as INITIALIZING - but will be checked immediately
+            backend_states[backend_key] = BackendState.INITIALIZING
+            backend_failures[backend_key] = 0
+            backend_successes[backend_key] = 0
+
+            # Set check time to now - no grace period
+            backend_check_times[backend_key] = time.time()
+
+            # Add to backends with placeholder latency
+            backends[model_index].append(
+                {
+                    "node": node,
+                    "port": port,
+                    "job_name": job["job_name"],
+                    "model_name": None,  # Will be retrieved later
+                    "latency": float("inf"),
+                }
+            )
+
+    # Check health and update model names for backends that need checking
+    now = time.time()
+    checked_models = False
+
+    for model_index in backends:
+        for backend in backends[model_index]:
+            backend_key = f"{backend['node']}:{backend['port']}"
+
+            # Skip backends that aren't due for checking yet
+            if (
+                backend_key in backend_check_times
+                and backend_check_times[backend_key] > now
+            ):
+                continue
+
+            # Skip DEAD backends
+            if backend_states.get(backend_key) == BackendState.DEAD:
+                continue
+
+            # Check health
+            is_healthy, latency = await check_backend_health(
+                backend["node"], backend["port"]
+            )
+            checked_models = True
 
             if is_healthy:
-                # Get model name from the API
-                model_name = await get_model_name(node, port)
+                # Update backend info
+                if not backend["model_name"]:
+                    # Get model name from the API
+                    model_name = await get_model_name(backend["node"], backend["port"])
+                    if model_name:
+                        backend["model_name"] = model_name
+                        model_names[model_index] = model_name
 
-                # Add to backends
-                new_backends[model_index].append(
-                    {
-                        "node": node,
-                        "port": port,
-                        "job_name": job["job_name"],
-                        "model_name": model_name,
-                        "latency": latency or float("inf"),
-                    }
+                # Update latency
+                backend["latency"] = latency or float("inf")
+
+    # Print status after changes
+    if checked_models:
+        print_backend_status()
+    else:
+        # Just print a short status update
+        healthy_count = sum(
+            1 for state in backend_states.values() if state == BackendState.HEALTHY
+        )
+        total_count = len(backend_states)
+        if total_count > 0:
+            print(
+                colorize(
+                    f"Backend status: {healthy_count}/{total_count} healthy backends",
+                    Colors.GREEN if healthy_count == total_count else Colors.YELLOW,
                 )
+            )
 
-                # Update model name mapping
-                if model_name:
-                    model_names[model_index] = model_name
 
-    # Update the global backends dictionary
-    backends = new_backends
+def create_short_model_name(model_name):
+    """Create a shortened version of the model name for display purposes."""
+    if not model_name:
+        return "Unknown"
 
-    # Print current backend status
-    print_backend_status()
+    # Split by '/'
+    parts = model_name.split("/")
+
+    shortened_parts = []
+    for part in parts:
+        # Split by '-'
+        segments = part.split("-")
+
+        # Shorten each segment
+        shortened_segments = []
+        for segment in segments:
+            # Take first 4 chars or all if len <= 4
+            shortened_segments.append(segment[:4] if len(segment) > 4 else segment)
+
+        # Join segments back with '-'
+        shortened_parts.append("-".join(shortened_segments))
+
+    # Join parts back with '/'
+    return "/".join(shortened_parts)
 
 
 def print_backend_status():
@@ -290,30 +532,42 @@ def print_backend_status():
 
     status_table = []
     headers = [
-        "Model Index",
         "Model Name",
         "Backend",
         "Job Name",
-        "Health",
+        "State",
         "Avg Latency (s)",
+        "In-flight",
         "Requests",
     ]
 
     for model_index, backend_list in sorted(backends.items()):
-        model_name = model_names.get(model_index, "Unknown")
+        full_model_name = model_names.get(model_index, "Unknown")
+        short_model_name = create_short_model_name(full_model_name)
+
+        # Format as "model_index:short_model_name"
+        display_model_name = f"{model_index}:{short_model_name}"
 
         for backend in backend_list:
             node = backend["node"]
             port = backend["port"]
             job_name = backend["job_name"]
+            backend_key = f"{node}:{port}"
 
             # Get health status
-            is_healthy = backend_health.get(f"{node}:{port}", True)
-            health_status = (
-                colorize("HEALTHY", Colors.GREEN)
-                if is_healthy
-                else colorize("UNHEALTHY", Colors.RED)
-            )
+            state = backend_states.get(backend_key, BackendState.HEALTHY)
+            if state == BackendState.HEALTHY:
+                state_str = colorize("HEALTHY", Colors.GREEN)
+            elif state == BackendState.DEGRADED:
+                state_str = colorize("DEGRADED", Colors.YELLOW)
+            elif state == BackendState.UNHEALTHY:
+                state_str = colorize("UNHEALTHY", Colors.RED)
+            elif state == BackendState.INITIALIZING:
+                discovery_time = backend_discovery_times.get(backend_key, time.time())
+                init_time = int(time.time() - discovery_time)
+                state_str = colorize(f"INITIALIZING ({init_time}s)", Colors.BLUE)
+            else:  # DEAD
+                state_str = colorize("DEAD", Colors.RED)
 
             # Get average latency
             avg_latency = get_avg_latency(node, port)
@@ -322,22 +576,49 @@ def print_backend_status():
             else:
                 latency_str = f"{avg_latency:.4f}"
 
-            # Get request count
-            request_count = backend_requests.get(f"{node}:{port}", 0)
+            # Get request count and in-flight
+            request_count = backend_requests.get(backend_key, 0)
+            in_flight = backend_in_flight.get(backend_key, 0)
 
             status_table.append(
                 [
-                    model_index,
-                    model_name,
-                    f"{node}:{port}",
+                    display_model_name,
+                    backend_key,
                     job_name,
-                    health_status,
+                    state_str,
                     latency_str,
+                    in_flight,
                     request_count,
                 ]
             )
 
     print(tabulate(status_table, headers=headers, tablefmt="pretty"))
+
+    # Print summary statistics
+    healthy_count = sum(
+        1 for state in backend_states.values() if state == BackendState.HEALTHY
+    )
+    degraded_count = sum(
+        1 for state in backend_states.values() if state == BackendState.DEGRADED
+    )
+    unhealthy_count = sum(
+        1 for state in backend_states.values() if state == BackendState.UNHEALTHY
+    )
+    initializing_count = sum(
+        1 for state in backend_states.values() if state == BackendState.INITIALIZING
+    )
+
+    print(
+        colorize("Summary: ", Colors.BOLD)
+        + colorize(f"{healthy_count} HEALTHY", Colors.GREEN)
+        + ", "
+        + colorize(f"{degraded_count} DEGRADED", Colors.YELLOW)
+        + ", "
+        + colorize(f"{unhealthy_count} UNHEALTHY", Colors.RED)
+        + ", "
+        + colorize(f"{initializing_count} INITIALIZING", Colors.BLUE)
+    )
+
     print("")
 
 
@@ -357,7 +638,7 @@ async def get_model_name(node, port):
 
 
 async def select_backend(model):
-    """Select the best backend for a given model using Least Response Time algorithm."""
+    """Select the best backend for a given model optimizing for reliability and performance."""
     # First, identify the model_index from the requested model
     target_model_index = None
     for model_index, name in model_names.items():
@@ -370,55 +651,148 @@ async def select_backend(model):
             status_code=400, detail=f"Model '{model}' not found in any backend"
         )
 
-    # Filter for healthy backends
+    # Filter for only HEALTHY backends
     healthy_backends = [
         b
         for b in backends[target_model_index]
-        if backend_health.get(f"{b['node']}:{b['port']}", True)
+        if backend_states.get(f"{b['node']}:{b['port']}", BackendState.HEALTHY)
+        == BackendState.HEALTHY
     ]
 
     if not healthy_backends:
-        # All backends are unhealthy, try to recover one
+        # No healthy backends - try to recover any available backend for immediate use
+        print(
+            colorize(
+                f"No healthy backends found for model '{model}', attempting recovery...",
+                Colors.YELLOW,
+            )
+        )
+
+        # First check if there are any backends in DEGRADED state that might be usable
+        degraded_backends = [
+            b
+            for b in backends[target_model_index]
+            if backend_states.get(f"{b['node']}:{b['port']}", BackendState.HEALTHY)
+            == BackendState.DEGRADED
+        ]
+
+        if degraded_backends:
+            # Use a degraded backend if available
+            print(
+                colorize(
+                    f"Using DEGRADED backend for model '{model}' as fallback",
+                    Colors.YELLOW,
+                )
+            )
+            selected_backend = min(
+                degraded_backends, key=lambda b: get_avg_latency(b["node"], b["port"])
+            )
+            backend_key = f"{selected_backend['node']}:{selected_backend['port']}"
+            backend_requests[backend_key] = backend_requests.get(backend_key, 0) + 1
+            backend_in_flight[backend_key] = backend_in_flight.get(backend_key, 0) + 1
+            return selected_backend
+
+        # Check for INITIALIZING backends
+        initializing_backends = [
+            b
+            for b in backends[target_model_index]
+            if backend_states.get(f"{b['node']}:{b['port']}", BackendState.HEALTHY)
+            == BackendState.INITIALIZING
+        ]
+
+        if initializing_backends:
+            # Try checking each INITIALIZING backend
+            for backend in initializing_backends:
+                node, port = backend["node"], backend["port"]
+                backend_key = f"{node}:{port}"
+
+                # Try to check if it's ready now
+                is_healthy, _ = await check_backend_health(node, port)
+                if is_healthy:
+                    print(
+                        colorize(
+                            f"Using newly healthy backend for model '{model}'",
+                            Colors.GREEN,
+                        )
+                    )
+                    backend_requests[backend_key] = (
+                        backend_requests.get(backend_key, 0) + 1
+                    )
+                    backend_in_flight[backend_key] = (
+                        backend_in_flight.get(backend_key, 0) + 1
+                    )
+                    return backend
+
+        # If no DEGRADED or ready INITIALIZING backends, try health checking UNHEALTHY ones
         for backend in backends[target_model_index]:
             node, port = backend["node"], backend["port"]
+            backend_key = f"{node}:{port}"
+
+            # Skip permanently DEAD backends
+            if backend_states.get(backend_key) == BackendState.DEAD:
+                continue
+
+            # Try to recover this backend
             is_healthy, _ = await check_backend_health(node, port)
-            if is_healthy:
+            if is_healthy or backend_states.get(backend_key) == BackendState.DEGRADED:
                 healthy_backends.append(backend)
                 break
 
     if not healthy_backends:
         raise HTTPException(
-            status_code=503, detail="No healthy backends available for this model"
+            status_code=503,
+            detail="No healthy or recoverable backends available for this model",
         )
 
-    # Sort by latency (Least Response Time algorithm)
-    healthy_backends.sort(key=lambda b: get_avg_latency(b["node"], b["port"]))
-
-    # Add some randomness to avoid all traffic going to a single backend
-    # Use a weighted random choice based on latency
-    weights = []
+    # Sort by load and latency
+    # Consider both the number of in-flight requests and the average latency
     for backend in healthy_backends:
-        latency = get_avg_latency(backend["node"], backend["port"])
-        # Convert latency to weight (lower latency = higher weight)
-        if latency == float("inf"):
-            weights.append(1)  # Default weight for backends with no latency data
+        backend_key = f"{backend['node']}:{backend['port']}"
+        backend["in_flight"] = backend_in_flight.get(backend_key, 0)
+
+    # First prefer backends with no in-flight requests
+    available_backends = [b for b in healthy_backends if b["in_flight"] == 0]
+
+    if available_backends:
+        # Sort by latency for backends with no in-flight requests
+        available_backends.sort(key=lambda b: get_avg_latency(b["node"], b["port"]))
+
+        # Add some randomness for load distribution - use weighted random choice
+        weights = []
+        for backend in available_backends:
+            latency = get_avg_latency(backend["node"], backend["port"])
+            # Convert latency to weight (lower latency = higher weight)
+            if latency == float("inf"):
+                weights.append(1)  # Default weight for backends with no latency data
+            else:
+                weights.append(1.0 / latency)
+
+        # Normalize weights
+        total_weight = sum(weights)
+        if total_weight == 0:
+            weights = [1.0 / len(available_backends)] * len(available_backends)
         else:
-            weights.append(1.0 / latency)
+            weights = [w / total_weight for w in weights]
 
-    # Normalize weights
-    total_weight = sum(weights)
-    if total_weight == 0:
-        # If all weights are zero, use equal weights
-        weights = [1.0 / len(healthy_backends)] * len(healthy_backends)
+        selected_backend = random.choices(available_backends, weights=weights, k=1)[0]
     else:
-        weights = [w / total_weight for w in weights]
+        # If all backends have in-flight requests, select the one with the least load
+        # and lowest latency using a combined score
+        for backend in healthy_backends:
+            latency = get_avg_latency(backend["node"], backend["port"])
+            if latency == float("inf"):
+                latency = 10.0  # Default high value for unknown latency
+            # Calculate a score that balances load and latency
+            # Lower score is better
+            backend["score"] = backend["in_flight"] * 2 + latency
 
-    # Select backend using weighted random choice
-    selected_backend = random.choices(healthy_backends, weights=weights, k=1)[0]
+        # Select backend with lowest score
+        selected_backend = min(healthy_backends, key=lambda b: b["score"])
 
-    # Update request count
+    # Update request count and in-flight requests
     backend_key = f"{selected_backend['node']}:{selected_backend['port']}"
     backend_requests[backend_key] = backend_requests.get(backend_key, 0) + 1
+    backend_in_flight[backend_key] = backend_in_flight.get(backend_key, 0) + 1
 
     return selected_backend
 
@@ -444,7 +818,10 @@ async def list_models():
         if model_index in backends:
             for backend in backends[model_index]:
                 node, port = backend["node"], backend["port"]
-                if backend_health.get(f"{node}:{port}", True):
+                if (
+                    backend_states.get(f"{node}:{port}", BackendState.HEALTHY)
+                    == BackendState.HEALTHY
+                ):
                     has_healthy_backend = True
                     break
 
@@ -463,7 +840,7 @@ async def list_models():
 
 @app.post("/v1/completions")
 async def create_completion(request: Request):
-    """Proxy completion requests to the appropriate backend."""
+    """Proxy completion requests to the appropriate backend with retry logic."""
     try:
         # Get request data
         data = await request.json()
@@ -475,25 +852,60 @@ async def create_completion(request: Request):
                 content={"error": "Model name is required"}, status_code=400
             )
 
-        # Select backend
-        backend = await select_backend(model)
-        node, port = backend["node"], backend["port"]
-
         # Check if streaming is requested
         stream = data.get("stream", False)
 
-        # Forward request to backend
-        url = f"http://{node}:{port}/v1/completions"
+        # Set up retry logic
+        retry_count = 0
+        max_retries = MAX_RETRIES
+        last_error = None
 
-        headers = {"Content-Type": "application/json"}
-        for header_name, header_value in request.headers.items():
-            if header_name.lower() not in ["host", "content-length"]:
-                headers[header_name] = header_value
+        while retry_count <= max_retries:
+            try:
+                # Select backend
+                backend = await select_backend(model)
+                node, port = backend["node"], backend["port"]
+                backend_key = f"{node}:{port}"
 
-        if stream:
-            return await stream_response(url, data, headers)
-        else:
-            return await proxy_request(url, data, headers)
+                # Forward request to backend
+                url = f"http://{node}:{port}/v1/completions"
+
+                headers = {"Content-Type": "application/json"}
+                for header_name, header_value in request.headers.items():
+                    if header_name.lower() not in ["host", "content-length"]:
+                        headers[header_name] = header_value
+
+                if stream:
+                    response = await stream_response(url, data, headers)
+                    return response
+                else:
+                    response = await proxy_request(url, data, headers)
+                    return response
+
+            except Exception as e:
+                last_error = e
+                retry_count += 1
+
+                if retry_count <= max_retries:
+                    # Log retry attempt
+                    print(
+                        colorize(
+                            f"Retry {retry_count}/{max_retries} for request to model '{model}' after error: {str(e)}",
+                            Colors.YELLOW,
+                        )
+                    )
+                    # Short delay before retry
+                    await asyncio.sleep(0.5)
+                else:
+                    # Max retries exceeded
+                    break
+
+        # If we get here, all retries failed
+        error_message = (
+            f"All {max_retries} retries failed for model '{model}': {str(last_error)}"
+        )
+        print(colorize(error_message, Colors.RED))
+        return JSONResponse(content={"error": error_message}, status_code=503)
 
     except HTTPException as e:
         return JSONResponse(content={"error": e.detail}, status_code=e.status_code)
@@ -505,20 +917,22 @@ async def create_completion(request: Request):
 
 
 async def proxy_request(url, data, headers):
-    """Forward a request to a backend and return the response."""
+    """Forward a request to a backend and return the response with timeout handling."""
+    # Extract backend key from URL for tracking
+    backend_key = url.split("//")[1].split("/")[0]
+
     start_time = time.time()
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
+    try:
+        # Use a timeout appropriate for non-streaming requests
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(url, json=data, headers=headers)
 
             # Update latency for this backend
-            node_port = url.split("//")[1].split("/")[0]  # Extract node:port from URL
             latency = time.time() - start_time
-
-            if node_port in recent_latencies:
-                recent_latencies[node_port].append(latency)
-                if len(recent_latencies[node_port]) > MAX_LATENCY_SAMPLES:
-                    recent_latencies[node_port] = recent_latencies[node_port][
+            if backend_key in recent_latencies:
+                recent_latencies[backend_key].append(latency)
+                if len(recent_latencies[backend_key]) > MAX_LATENCY_SAMPLES:
+                    recent_latencies[backend_key] = recent_latencies[backend_key][
                         -MAX_LATENCY_SAMPLES:
                     ]
 
@@ -528,55 +942,153 @@ async def proxy_request(url, data, headers):
                 status_code=response.status_code,
                 headers=dict(response.headers),
             )
-        except Exception as e:
-            # Mark backend as unhealthy
-            node_port = url.split("//")[1].split("/")[0]
-            backend_failures[node_port] = backend_failures.get(node_port, 0) + 1
-            if backend_failures[node_port] >= FAILURE_THRESHOLD:
-                backend_health[node_port] = False
+    except Exception as e:
+        # Mark backend as DEGRADED
+        backend_failures[backend_key] = backend_failures.get(backend_key, 0) + 1
+        backend_successes[backend_key] = 0
 
-            print(colorize(f"Backend request failed: {e}", Colors.RED))
-            raise HTTPException(
-                status_code=503, detail=f"Backend request failed: {str(e)}"
+        # Update state based on failure count
+        if backend_failures[backend_key] >= FAILURE_THRESHOLD:
+            backend_states[backend_key] = BackendState.UNHEALTHY
+            print(
+                colorize(
+                    f"Backend {backend_key} marked UNHEALTHY after {FAILURE_THRESHOLD} failures",
+                    Colors.RED,
+                )
             )
+        elif backend_states.get(backend_key) == BackendState.HEALTHY:
+            backend_states[backend_key] = BackendState.DEGRADED
+            print(
+                colorize(
+                    f"Backend {backend_key} marked DEGRADED: {str(e)}", Colors.YELLOW
+                )
+            )
+
+        # Update check time for next health check
+        update_next_check_time(backend_key)
+
+        print(colorize(f"Backend request failed: {e}", Colors.RED))
+        raise HTTPException(status_code=503, detail=f"Backend request failed: {str(e)}")
+    finally:
+        # Always decrement in-flight count
+        if backend_key in backend_in_flight:
+            backend_in_flight[backend_key] = max(0, backend_in_flight[backend_key] - 1)
 
 
 async def stream_response(url, data, headers):
-    """Stream a response from a backend."""
+    """Stream a response from a backend with timeout for first token."""
+    # Extract backend key from URL for tracking
+    backend_key = url.split("//")[1].split("/")[0]
 
     async def generate():
+        nonlocal backend_key
         start_time = time.time()
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            try:
-                async with client.stream(
-                    "POST", url, json=data, headers=headers
-                ) as response:
-                    async for chunk in response.aiter_bytes():
-                        yield chunk
+        first_token_received = False
 
-                # Update latency after streaming completes
-                node_port = url.split("//")[1].split("/")[0]
-                latency = time.time() - start_time
+        try:
+            # Use longer timeout for streaming connections but monitor first token arrival
+            async with httpx.AsyncClient(timeout=None) as client:
+                try:
+                    async with client.stream(
+                        "POST", url, json=data, headers=headers
+                    ) as response:
+                        async for chunk in response.aiter_bytes():
+                            # Check for first token timeout
+                            if not first_token_received:
+                                first_token_received = True
+                                time_to_first_token = time.time() - start_time
+                                if time_to_first_token > REQUEST_STREAM_TIMEOUT:
+                                    # First token took too long, but we got it anyway
+                                    print(
+                                        colorize(
+                                            f"Warning: First token from {backend_key} took {time_to_first_token:.2f}s (threshold: {REQUEST_STREAM_TIMEOUT}s)",
+                                            Colors.YELLOW,
+                                        )
+                                    )
 
-                if node_port in recent_latencies:
-                    recent_latencies[node_port].append(latency)
-                    if len(recent_latencies[node_port]) > MAX_LATENCY_SAMPLES:
-                        recent_latencies[node_port] = recent_latencies[node_port][
-                            -MAX_LATENCY_SAMPLES:
-                        ]
+                            yield chunk
 
-            except Exception as e:
-                # Mark backend as unhealthy
-                node_port = url.split("//")[1].split("/")[0]
-                backend_failures[node_port] = backend_failures.get(node_port, 0) + 1
-                if backend_failures[node_port] >= FAILURE_THRESHOLD:
-                    backend_health[node_port] = False
+                    # Update latency only if we've received at least the first token
+                    if first_token_received:
+                        latency = time.time() - start_time
+                        if backend_key in recent_latencies:
+                            recent_latencies[backend_key].append(latency)
+                            if len(recent_latencies[backend_key]) > MAX_LATENCY_SAMPLES:
+                                recent_latencies[backend_key] = recent_latencies[
+                                    backend_key
+                                ][-MAX_LATENCY_SAMPLES:]
+                except asyncio.TimeoutError:
+                    # Handle timeout for first token
+                    if (
+                        not first_token_received
+                        and (time.time() - start_time) > REQUEST_STREAM_TIMEOUT
+                    ):
+                        print(
+                            colorize(
+                                f"Streaming timeout: No response from {backend_key} after {REQUEST_STREAM_TIMEOUT}s",
+                                Colors.RED,
+                            )
+                        )
 
-                print(colorize(f"Backend streaming request failed: {e}", Colors.RED))
-                # We can't raise an HTTPException during streaming, so we yield an error JSON
-                yield json.dumps(
-                    {"error": f"Backend streaming request failed: {str(e)}"}
-                ).encode()
+                        # Mark backend as DEGRADED due to timeout
+                        backend_failures[backend_key] = (
+                            backend_failures.get(backend_key, 0) + 1
+                        )
+                        backend_successes[backend_key] = 0
+
+                        if backend_states.get(backend_key) == BackendState.HEALTHY:
+                            backend_states[backend_key] = BackendState.DEGRADED
+
+                        # Update check time
+                        update_next_check_time(backend_key)
+
+                        # Return error message to client
+                        yield json.dumps(
+                            {
+                                "error": f"Streaming timeout: No response after {REQUEST_STREAM_TIMEOUT}s"
+                            }
+                        ).encode()
+                except Exception as e:
+                    # Mark backend as DEGRADED
+                    backend_failures[backend_key] = (
+                        backend_failures.get(backend_key, 0) + 1
+                    )
+                    backend_successes[backend_key] = 0
+
+                    # Update state based on failure count
+                    if backend_failures[backend_key] >= FAILURE_THRESHOLD:
+                        backend_states[backend_key] = BackendState.UNHEALTHY
+                        print(
+                            colorize(
+                                f"Backend {backend_key} marked UNHEALTHY after {FAILURE_THRESHOLD} failures",
+                                Colors.RED,
+                            )
+                        )
+                    elif backend_states.get(backend_key) == BackendState.HEALTHY:
+                        backend_states[backend_key] = BackendState.DEGRADED
+                        print(
+                            colorize(
+                                f"Backend {backend_key} marked DEGRADED: {str(e)}",
+                                Colors.YELLOW,
+                            )
+                        )
+
+                    # Update check time
+                    update_next_check_time(backend_key)
+
+                    print(
+                        colorize(f"Backend streaming request failed: {e}", Colors.RED)
+                    )
+                    # We can't raise an HTTPException during streaming, so we yield an error JSON
+                    yield json.dumps(
+                        {"error": f"Backend streaming request failed: {str(e)}"}
+                    ).encode()
+        finally:
+            # Always ensure we decrement the in-flight count, even if client disconnects
+            if backend_key in backend_in_flight:
+                backend_in_flight[backend_key] = max(
+                    0, backend_in_flight[backend_key] - 1
+                )
 
     return StreamingResponse(generate())
 
@@ -611,8 +1123,8 @@ def main():
         app,
         host="0.0.0.0",
         port=args.port,
-        log_level="error",  # Only show error logs, not info or access logs
-        access_log=False,  # Disable access logs completely
+        log_level="error",
+        access_log=False,
     )
 
 
