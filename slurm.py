@@ -13,8 +13,8 @@ from datetime import datetime
 from tabulate import tabulate
 
 # Test mode configuration
-TEST_BASE_TIME = 120  # Initial base time (seconds)
-TEST_INTERVAL = 30  # Time interval between job failures (seconds)
+TEST_BASE_TIME = 180  # Initial base time (seconds)
+TEST_INTERVAL = 45  # Time interval between job failures (seconds)
 
 # Track job submission counts for test mode
 test_job_submission_counts = {}  # {(model_index, job_id): count}

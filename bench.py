@@ -14,6 +14,8 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from openai import AsyncOpenAI
 from tabulate import tabulate
+import argparse
+import math
 
 
 # ANSI color codes for colorful output
@@ -35,12 +37,13 @@ def colorize(text, color):
 
 
 # Constants
-BASE_URL = "http://localhost:9090/v1"  # OpenAI-compatible endpoint
+BASE_URL = None  # Will be set based on API port argument
 CONFIG_PATH = "config.yaml"
-MAX_CONCURRENCY = 500  # Maximum concurrent requests
+MAX_CONCURRENCY = 400  # Maximum concurrent requests
 UPDATE_INTERVAL = 2  # Seconds between metric updates
 RESPONSE_SAMPLE_SIZE = 2  # Number of example responses to keep per model/question type
 MAX_TOKENS = 1000  # Increased max tokens to ensure complete answers
+IMBALANCE_RATIO = 0  # Default imbalance ratio (0 = even distribution)
 
 
 # Question types with examples
@@ -97,13 +100,63 @@ def load_models_from_config():
             config = yaml.safe_load(f)
 
         models = {}
-        for model_idx, model_info in config.items():
-            model_name = model_info.get("model_name")
-            if model_name:
-                models[model_name] = {
-                    "index": model_idx,
-                    "jobs": model_info.get("number_of_jobs", 1),
-                }
+
+        # Check if we're using the new config format with total_number_of_jobs
+        if "total_number_of_jobs" in config:
+            total_jobs = config["total_number_of_jobs"]
+
+            # Count the number of valid model entries
+            model_indices = [k for k in config if isinstance(k, int)]
+            model_count = len(model_indices)
+
+            if model_count == 0:
+                print(colorize("No valid model entries found in config", Colors.RED))
+                sys.exit(1)
+
+            # Calculate jobs per model (same logic as in slapi.py)
+            base_jobs_per_model = total_jobs // model_count
+            extra_jobs = total_jobs % model_count
+
+            # Assign jobs to models
+            for i, model_idx in enumerate(sorted(model_indices)):
+                model_info = config[model_idx]
+                model_name = model_info.get("model_name")
+
+                if model_name:
+                    # Calculate jobs for this model
+                    if i < extra_jobs:
+                        job_count = base_jobs_per_model + 1
+                    else:
+                        job_count = base_jobs_per_model
+
+                    models[model_name] = {
+                        "index": model_idx,
+                        "jobs": job_count,
+                    }
+
+            print(
+                colorize(
+                    f"Using new config format: {total_jobs} total jobs distributed among {model_count} models",
+                    Colors.CYAN,
+                )
+            )
+
+        # Legacy format with per-model number_of_jobs
+        else:
+            for model_idx, model_info in config.items():
+                if isinstance(model_idx, int) and "model_name" in model_info:
+                    model_name = model_info.get("model_name")
+                    models[model_name] = {
+                        "index": model_idx,
+                        "jobs": model_info.get("number_of_jobs", 1),
+                    }
+
+            print(
+                colorize(
+                    "Using legacy config format with per-model job counts",
+                    Colors.YELLOW,
+                )
+            )
 
         return models
     except Exception as e:
@@ -279,6 +332,42 @@ async def make_request(client, model, question_type):
     }
 
 
+def calculate_model_weights(model_names):
+    """
+    Calculate weights for model selection based on the imbalance ratio.
+
+    Args:
+        model_names: List of model names
+
+    Returns:
+        Dictionary mapping model names to their selection weights/probabilities
+    """
+    # If only one model, return 100% for that model
+    if len(model_names) <= 1:
+        return {model_names[0]: 1.0} if model_names else {}
+
+    # If imbalance ratio is 0, distribute evenly
+    if IMBALANCE_RATIO == 0:
+        weight = 1.0 / len(model_names)
+        return {name: weight for name in model_names}
+
+    # Calculate exponential weights based on position and imbalance ratio
+    # Later models in the list get progressively higher weights
+    weights = []
+    for i in range(len(model_names)):
+        # Use exponential function to create imbalance
+        # Higher ratio = more dramatic differences between models
+        weight = math.exp(i * IMBALANCE_RATIO)
+        weights.append(weight)
+
+    # Normalize weights to sum to 1.0
+    total_weight = sum(weights)
+    normalized_weights = [w / total_weight for w in weights]
+
+    # Create dictionary mapping model names to their weights
+    return {model_names[i]: normalized_weights[i] for i in range(len(model_names))}
+
+
 async def run_benchmark(models):
     """Run continuous benchmark across all models and question types."""
     global active_requests, start_time, running
@@ -296,6 +385,10 @@ async def run_benchmark(models):
     model_names = list(models.keys())
     question_types = list(QUESTION_TYPES.keys())
 
+    # Calculate model weights for selection based on imbalance ratio
+    model_weights = calculate_model_weights(model_names)
+    model_weights_list = [(model, weight) for model, weight in model_weights.items()]
+
     # Set up display task
     display_task = asyncio.create_task(display_metrics(models, UPDATE_INTERVAL))
 
@@ -303,8 +396,20 @@ async def run_benchmark(models):
     while running:
         # Generate new tasks up to MAX_CONCURRENCY
         while active_requests < MAX_CONCURRENCY and running:
-            # Randomly select model and question type
-            model = random.choice(model_names)
+            # Select model based on weights
+            if IMBALANCE_RATIO > 0:
+                # Weighted random selection using the calculated probabilities
+                # Choose a random model according to the weights
+                model = random.choices(
+                    [item[0] for item in model_weights_list],
+                    weights=[item[1] for item in model_weights_list],
+                    k=1,
+                )[0]
+            else:
+                # Original behavior: randomly select model
+                model = random.choice(model_names)
+
+            # Randomly select question type
             q_type = random.choice(question_types)
 
             # Create a task for this request
@@ -356,12 +461,16 @@ async def display_metrics(models, interval):
         summary_headers = [
             "Model",
             "Requests",
+            "% of Total",
             "Failed",
             "Avg Latency (s)",
             "Max Latency (s)",
             "99% Latency (s)",
             "Tokens/sec",
         ]
+
+        # Calculate total requests across all models for percentage
+        total_requests = sum(metrics[model_name]["count"] for model_name in metrics)
 
         # Collect metrics for all models
         for model_name in models.keys():
@@ -375,6 +484,9 @@ async def display_metrics(models, interval):
 
                 # Calculate summary metrics
                 requests = m["count"]
+                request_percentage = (
+                    (requests / total_requests * 100) if total_requests > 0 else 0
+                )
                 failed = requests - m["success"]
                 avg_latency = (
                     sum(m["latencies"]) / len(m["latencies"]) if m["latencies"] else 0
@@ -420,10 +532,20 @@ async def display_metrics(models, interval):
                 else:
                     failed_str = colorize(f"{failed}", Colors.RED)
 
+                # Format percentages differently based on imbalance ratio
+                if IMBALANCE_RATIO > 0:
+                    # Highlight imbalanced request distribution
+                    request_pct_str = colorize(
+                        f"{request_percentage:.1f}%", Colors.YELLOW
+                    )
+                else:
+                    request_pct_str = f"{request_percentage:.1f}%"
+
                 summary_table.append(
                     [
                         display_name,
                         requests,
+                        request_pct_str,
                         failed_str,
                         f"{avg_latency:.2f}",
                         f"{max_latency:.2f}",
@@ -444,6 +566,16 @@ async def display_metrics(models, interval):
                 f"\nActive requests: {active_requests}/{MAX_CONCURRENCY}", Colors.CYAN
             )
         )
+
+        # Print imbalance ratio info if set
+        if IMBALANCE_RATIO > 0:
+            print(
+                colorize(
+                    f"Imbalance ratio: {IMBALANCE_RATIO} (higher values = more imbalanced distribution)",
+                    Colors.YELLOW,
+                )
+            )
+
         print(colorize("Press Ctrl+C to stop and generate final report", Colors.YELLOW))
 
         # Wait for next update
@@ -478,12 +610,18 @@ def generate_final_report(models):
     summary_headers = [
         "Model",
         "Requests",
+        "% of Total",
         "Failed",
         "Avg Latency (s)",
         "Max Latency (s)",
         "99% Latency (s)",
         "Tokens/sec",
     ]
+
+    # Calculate total requests across all models for percentage
+    total_requests = sum(
+        metrics[model_name]["count"] for model_name in metrics if model_name in metrics
+    )
 
     # Collect metrics for all models
     for model_name in models.keys():
@@ -497,6 +635,9 @@ def generate_final_report(models):
 
             # Calculate summary metrics
             requests = m["count"]
+            request_percentage = (
+                (requests / total_requests * 100) if total_requests > 0 else 0
+            )
             failed = requests - m["success"]
             avg_latency = (
                 sum(m["latencies"]) / len(m["latencies"]) if m["latencies"] else 0
@@ -527,10 +668,18 @@ def generate_final_report(models):
             else:
                 failed_str = colorize(f"{failed}", Colors.RED)
 
+            # Format percentages differently based on imbalance ratio
+            if IMBALANCE_RATIO > 0:
+                # Highlight imbalanced request distribution
+                request_pct_str = colorize(f"{request_percentage:.1f}%", Colors.YELLOW)
+            else:
+                request_pct_str = f"{request_percentage:.1f}%"
+
             summary_table.append(
                 [
                     display_name,
                     requests,
+                    request_pct_str,
                     failed_str,
                     f"{avg_latency:.2f}",
                     f"{max_latency:.2f}",
@@ -544,6 +693,41 @@ def generate_final_report(models):
 
     # Print summary table
     print(tabulate(summary_table, headers=summary_headers, tablefmt="pretty"))
+
+    # Print imbalance ratio information if used
+    if IMBALANCE_RATIO > 0:
+        print(colorize(f"\nImbalance ratio: {IMBALANCE_RATIO}", Colors.YELLOW))
+        print(
+            "Higher ratios create more imbalanced request distribution between models"
+        )
+        print(
+            "This simulates different request patterns to test dynamic load balancing"
+        )
+
+        # Show the theoretical model weights used
+        model_weights = calculate_model_weights(list(models.keys()))
+        print(colorize("\nTheoretical request distribution:", Colors.CYAN))
+        weight_table = []
+        for model_name, weight in model_weights.items():
+            model_index = models[model_name]["index"]
+            short_name = shorten_model_name(model_name)
+            display_name = f"{model_index}:{short_name}"
+
+            # Calculate actual percentage from data
+            actual_count = metrics[model_name]["count"] if model_name in metrics else 0
+            actual_pct = (
+                (actual_count / total_requests * 100) if total_requests > 0 else 0
+            )
+
+            weight_table.append([display_name, f"{weight:.1%}", f"{actual_pct:.1f}%"])
+
+        print(
+            tabulate(
+                weight_table,
+                headers=["Model", "Theoretical %", "Actual %"],
+                tablefmt="pretty",
+            )
+        )
 
     # Generate example responses for each model and question type
     print(colorize("\nExample Responses:", Colors.BOLD))
@@ -586,6 +770,26 @@ def signal_handler(sig, frame):
 
 def main():
     """Entry point to run the benchmark."""
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="vLLM Continuous Benchmark")
+    parser.add_argument(
+        "--imbalance-ratio",
+        type=float,
+        default=0.0,
+        help="Imbalance ratio for request distribution (0 = even, higher = more imbalanced)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=9090,
+        help="API port to use for the benchmark",
+    )
+    args = parser.parse_args()
+
+    global IMBALANCE_RATIO, BASE_URL
+    IMBALANCE_RATIO = args.imbalance_ratio
+    BASE_URL = f"http://localhost:{args.port}/v1"
+
     # Load models from config
     models = load_models_from_config()
 
@@ -615,6 +819,17 @@ def main():
     print(colorize(f"  - Update interval: {UPDATE_INTERVAL} seconds", Colors.GREEN))
     print(colorize(f"  - API endpoint: {BASE_URL}", Colors.GREEN))
     print(colorize(f"  - Max tokens per response: {MAX_TOKENS}", Colors.GREEN))
+    print(colorize(f"  - Imbalance ratio: {IMBALANCE_RATIO}", Colors.GREEN))
+
+    # If imbalance ratio is set, show the distribution
+    if IMBALANCE_RATIO > 0:
+        model_weights = calculate_model_weights(list(models.keys()))
+        print(colorize("\nRequest distribution:", Colors.CYAN))
+        for model_name, weight in model_weights.items():
+            model_index = models[model_name]["index"]
+            short_name = shorten_model_name(model_name)
+            display_name = f"{model_index}:{short_name}"
+            print(colorize(f"  - {display_name}: {weight:.1%}", Colors.GREEN))
 
     print(colorize("\nStarting benchmark in 3 seconds...", Colors.YELLOW))
     time.sleep(3)

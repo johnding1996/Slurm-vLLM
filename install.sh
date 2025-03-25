@@ -201,8 +201,7 @@ create_log_dir() {
 make_scripts_executable() {
     print_color "${CYAN}" "🔧 Making scripts executable..."
     
-    chmod +x slurm.py
-    chmod +x api.py
+    chmod +x slapi.py
     chmod +x bench.py
     
     print_color "${GREEN}" "✅ Scripts are now executable."
@@ -235,9 +234,8 @@ print_header "Installation Complete"
 print_color "${GREEN}" "✅ vLLM Slurm Toolkit has been successfully installed!"
 print_color "${CYAN}" "📌 To use the toolkit:"
 echo -e "   1. Activate the virtual environment: ${YELLOW}source ./venv/bin/activate${ENDC}"
-echo -e "   2. Run the Slurm job manager: ${YELLOW}./slurm.py${ENDC}"
-echo -e "   3. Run the API proxy: ${YELLOW}./api.py${ENDC}"
-echo -e "   4. Run the benchmarking tool: ${YELLOW}./bench.py${ENDC}"
+echo -e "   2. Run the vLLM Slurm API system: ${YELLOW}./slapi.py${ENDC}"
+echo -e "   3. Run the benchmarking tool: ${YELLOW}./bench.py${ENDC}"
 print_color "${CYAN}" "📌 For more information, see the README.md file."
 echo
 print_color "${GREEN}${BOLD}" "Happy benchmarking! 🚀" 

@@ -1,6 +1,13 @@
 # vLLM Slurm Job Configuration
 
+# Total number of jobs to distribute across all models
+# When specified, the system will dynamically balance jobs based on request patterns
+total_number_of_jobs: 10
+
 1:
   model_name: "neuralmagic/Qwen2-0.5B-Instruct-FP8"
-  number_of_jobs: 10
+  gpu: "gpu:rtxa4000:1"
+
+2:
+  model_name: "Qwen/Qwen2.5-0.5B-Instruct"
   gpu: "gpu:rtxa4000:1"
