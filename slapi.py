@@ -518,7 +518,7 @@ echo "Time: $(date)"
 echo "Time Limit: {slurm_params['time_limit']}"
 echo "========================================================"
 
-vllm serve {model_name} --port {port}
+vllm serve {model_name} --port {port} --download-dir /fs/cml-projects/E2H/Huggingface_cache --max-model-len 8192 --gpu-memory-utilization 0.95
 """
         temp_file.write(job_script)
 
@@ -1969,6 +1969,80 @@ def create_api_app():
 
                     # Forward request to backend
                     url = f"http://{node}:{port}/v1/completions"
+
+                    headers = {"Content-Type": "application/json"}
+                    for header_name, header_value in request.headers.items():
+                        if header_name.lower() not in ["host", "content-length"]:
+                            headers[header_name] = header_value
+
+                    if stream:
+                        response = await stream_response(url, data, headers)
+                        return response
+                    else:
+                        response = await proxy_request(url, data, headers)
+                        return response
+
+                except Exception as e:
+                    last_error = e
+                    retry_count += 1
+
+                    if retry_count <= max_retries:
+                        # Log retry attempt (deduplicated)
+                        log_once(
+                            f"Retry {retry_count}/{max_retries} for request to model '{model}' after error: {str(e)}",
+                            Colors.YELLOW,
+                        )
+                        # Short delay before retry
+                        await asyncio.sleep(0.5)
+                    else:
+                        # Max retries exceeded
+                        break
+
+            # If we get here, all retries failed
+            error_message = f"All {max_retries} retries failed for model '{model}': {str(last_error)}"
+            log_once(error_message, Colors.RED)
+            return JSONResponse(content={"error": error_message}, status_code=503)
+
+        except HTTPException as e:
+            return JSONResponse(content={"error": e.detail}, status_code=e.status_code)
+        except Exception as e:
+            log_once(f"Error processing request: {e}", Colors.RED)
+            return JSONResponse(
+                content={"error": f"Error processing request: {str(e)}"},
+                status_code=500,
+            )
+
+    @app.post("/v1/chat/completions")
+    async def create_chat_completion(request: Request):
+        """Proxy completion requests to the appropriate backend with retry logic."""
+        try:
+            # Get request data
+            data = await request.json()
+
+            # Extract model name
+            model = data.get("model")
+            if not model:
+                return JSONResponse(
+                    content={"error": "Model name is required"}, status_code=400
+                )
+
+            # Check if streaming is requested
+            stream = data.get("stream", False)
+
+            # Set up retry logic
+            retry_count = 0
+            max_retries = MAX_RETRIES
+            last_error = None
+
+            while retry_count <= max_retries:
+                try:
+                    # Select backend
+                    backend = await select_backend(model)
+                    node, port = backend["node"], backend["port"]
+                    backend_key = f"{node}:{port}"
+
+                    # Forward request to backend
+                    url = f"http://{node}:{port}/v1/chat/completions"
 
                     headers = {"Content-Type": "application/json"}
                     for header_name, header_value in request.headers.items():
